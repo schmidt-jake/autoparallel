@@ -24,6 +24,8 @@ import pulp
 import torch
 from torch.utils._pytree import tree_map_only
 
+from autoparallel.milp import resolve_milp_backend
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 
@@ -533,6 +535,9 @@ def load_optimizer(cls, path):
     opt.persistent_aliases = save_dict.get("persistent_aliases", {})
     opt._prefetch_discount = save_dict.get("prefetch_discount", 1.0)
     opt.solver_time_limit_seconds = save_dict.get("solver_time_limit_seconds")
+    # The backend is a property of the process that solves, not of the saved problem.
+    opt.milp_backend = resolve_milp_backend()
+    opt.solve_report = None
     opt._prefetchable_keys = None
     opt.skipped_clusters = save_dict.get("skipped_clusters", [])
     opt._constraint_log = []

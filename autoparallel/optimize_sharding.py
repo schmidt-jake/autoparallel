@@ -119,6 +119,7 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
+from .milp import SolveReport, make_milp_solver, resolve_milp_backend, solve_report
 from .shardings.auto_functionalize import is_auto_functionalized_v2
 from .shardings.dtensor_sharding_helpers import (
     STRICT_REPLICATION_ENV,
@@ -301,6 +302,7 @@ class ShardingOptimizer:
         persistent_aliases=None,
         solver_time_limit_seconds: float | None = None,
         grad_reduce_dtype: torch.dtype | None = None,
+        milp_backend: str | None = None,
     ):
         reset_placement_options_cache()
         reset_compute_cost_cache()
@@ -325,6 +327,9 @@ class ShardingOptimizer:
         if solver_time_limit_seconds is not None and solver_time_limit_seconds <= 0:
             raise ValueError("solver_time_limit_seconds must be positive")
         self.solver_time_limit_seconds = solver_time_limit_seconds
+        # HiGHS when highspy is importable, else CBC (see autoparallel.milp).
+        self.milp_backend = resolve_milp_backend(milp_backend)
+        self.solve_report: SolveReport | None = None
         self._constraint_log: list[tuple[str, dict]] = []
         self._memory_constraint: tuple[float, float] | None = None
         self._prefetch_discount = 1.0
@@ -1132,13 +1137,13 @@ class ShardingOptimizer:
 
     def _solve(self, verbose=False):
         self._apply_memory_constraint()
-        solver = pulp.PULP_CBC_CMD(
-            msg=verbose,
-            timeLimit=self.solver_time_limit_seconds,
+        solver = make_milp_solver(
+            self.milp_backend, msg=verbose, time_limit=self.solver_time_limit_seconds
         )
         # Use a dedicated temp directory for PuLP's intermediate files (.mps,
         # .sol, etc.) so they are always cleaned up, even if the process is
         # killed.  Without this, leftover files can fill up /tmp (tmpfs).
+        # (CBC writes them; HiGHS solves in process.)
         with tempfile.TemporaryDirectory() as tmpdir:
             solver.tmpDir = tmpdir
             self.prob.solve(solver)
@@ -1147,21 +1152,42 @@ class ShardingOptimizer:
             self.solver_time_limit_seconds is not None
             and self.prob.solutionTime >= self.solver_time_limit_seconds
         )
-        if reached_time_limit and (
-            self.prob.status != pulp.LpStatusOptimal
-            or self.prob.sol_status != pulp.LpSolutionOptimal
-        ):
+        optimal = (
+            self.prob.status == pulp.LpStatusOptimal
+            and self.prob.sol_status == pulp.LpSolutionOptimal
+        )
+        incumbent = (
+            reached_time_limit
+            and self.prob.status == pulp.LpStatusOptimal
+            and self.prob.sol_status == pulp.LpSolutionIntegerFeasible
+        )
+        if reached_time_limit and not optimal and not incumbent:
             status = pulp.LpStatus.get(self.prob.status, str(self.prob.status))
             solution_status = pulp.LpSolution.get(
                 self.prob.sol_status, str(self.prob.sol_status)
             )
             raise TimeoutError(
-                "AutoParallel sharding solve did not prove an optimal solution "
+                "AutoParallel sharding solve found no feasible solution "
                 f"within {self.solver_time_limit_seconds:g} seconds "
-                f"(status={status}, solution_status={solution_status}). "
+                f"(backend={self.milp_backend}, status={status}, "
+                f"solution_status={solution_status}). "
                 "PuLP elapsed time includes problem-file setup; retry with a "
                 "larger limit to distinguish a near-deadline solver result."
             )
+        if incumbent:
+            # The time limit, with an integer-feasible point: accept it, and say how far
+            # from proven it is (the gap, where the backend reports a bound).
+            self.solve_report = solve_report(
+                self.prob, self.milp_backend, incumbent=True
+            )
+            logger.warning(
+                "AutoParallel sharding solve reached its %gs time limit; accepting the "
+                "best feasible solution (%s)",
+                self.solver_time_limit_seconds,
+                self.solve_report.describe(),
+            )
+            self._select_keys()
+            return
         if self.prob.status == pulp.LpStatusInfeasible:
             logger.warning(self.get_violated_constraints_log())
             raise RuntimeError(
@@ -1184,6 +1210,12 @@ class ShardingOptimizer:
                 f"(solution_status={solution_status})"
             )
 
+        self.solve_report = solve_report(self.prob, self.milp_backend, incumbent=False)
+        logger.debug("AutoParallel sharding solve: %s", self.solve_report.describe())
+        self._select_keys()
+
+    def _select_keys(self):
+        """The decision variables set to 1, each root with the copies linked to it."""
         self.selected_keys = [
             key for key, dv in self.decision_vars.items() if dv.var.value() == 1
         ]
