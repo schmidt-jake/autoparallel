@@ -119,6 +119,13 @@ from .graph_passes.graph_utils import (
     build_param_derived_set,
     build_terminal_derived_set,
 )
+from .shardings.auto_functionalize import is_auto_functionalized_v2
+from .shardings.dtensor_sharding_helpers import (
+    STRICT_REPLICATION_ENV,
+    clear_implicit_fallbacks,
+    implicit_fallbacks,
+    strict_replication_prefixes,
+)
 from .shardings.placement_options import (
     get_placement_options_for_node,
     reset_placement_options_cache,
@@ -328,7 +335,9 @@ class ShardingOptimizer:
         self._node_constraint_names: dict[str, str] = {}
         self._name_counters: dict[str, int] = {}
         t0 = time.perf_counter()
+        clear_implicit_fallbacks()
         self.strats = self.build_sharding_metadata()
+        self._check_strict_replication()
         # nodes/node_map are derived from strats (not graph.nodes) so that
         # shape-computation nodes skipped by build_sharding_metadata don't
         # appear and indices stay consistent.
@@ -370,6 +379,37 @@ class ShardingOptimizer:
             n_unique_vars,
             len(self.decision_vars),
             n_constraints,
+        )
+
+    def _check_strict_replication(self):
+        """Raise if an op in a strict namespace was given the all-Replicate fallback."""
+        prefixes = strict_replication_prefixes()
+        fallen = {n for n in implicit_fallbacks() if n.startswith(prefixes)}
+        if not prefixes or not fallen:
+            return
+        nodes: dict[str, list[str]] = {name: [] for name in sorted(fallen)}
+        for node in self.graph.nodes:
+            if node.op != "call_function":
+                continue
+            target = node.args[0] if is_auto_functionalized_v2(node) else node.target
+            name = target.name() if isinstance(target, torch._ops.OpOverload) else None
+            if name in nodes:
+                via = (
+                    " (inside auto_functionalized_v2)"
+                    if target is not node.target
+                    else ""
+                )
+                nodes[name].append(node.name + via)
+        detail = "\n".join(
+            f"  {name}: {', '.join(found[:5])}{' ...' if len(found) > 5 else ''}"
+            for name, found in nodes.items()
+        )
+        raise RuntimeError(
+            "strict replication: these ops have no registered DTensor sharding rule and "
+            "would be silently replicated:\n"
+            f"{detail}\n"
+            "Register a rule (torch.distributed.tensor.experimental.register_sharding) next "
+            f"to each op, or unset {STRICT_REPLICATION_ENV}."
         )
 
     def _get_next_name(self, prefix):

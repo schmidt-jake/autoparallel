@@ -41,6 +41,7 @@ from autoparallel.shardings.auto_functionalize import (
     decode_auto_functionalized_v2,
     is_auto_functionalized_v2,
 )
+from autoparallel.shardings.dtensor_sharding_helpers import strict_replication
 from autoparallel.shardings.placement_options import reset_placement_options_cache
 
 # ---------------------------------------------------------------------------
@@ -536,3 +537,61 @@ def test_apply_redistributes_a_misplaced_base():
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_apply_matches_eager_no_return_two_mutated(world_size):
     _spawn("pick", world_size, (Shard(0), Shard(0), Shard(0)))
+
+
+# ---------------------------------------------------------------------------
+# Strict mode: no silent replication
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("ap_af_test::norule_mut", mutates_args=("buf",))
+def norule_mut(x: torch.Tensor, buf: torch.Tensor) -> None:
+    buf.add_(x)
+
+
+@norule_mut.register_fake
+def _norule_mut_fake(x, buf) -> None:
+    return None
+
+
+@torch.library.custom_op("ap_af_test::norule_pure", mutates_args=())
+def norule_pure(x: torch.Tensor) -> torch.Tensor:
+    return x * 3
+
+
+@norule_pure.register_fake
+def _norule_pure_fake(x):
+    return torch.empty_like(x)
+
+
+class NoRule(torch.nn.Module):
+    def forward(self, x, buf):
+        torch.ops.ap_af_test.norule_mut(x, buf)
+        return (torch.ops.ap_af_test.norule_pure(buf),)
+
+
+def test_strict_replication_names_each_fallback_op(mesh_1d):
+    gm, fake_mode = _export(NoRule(), torch.randn(64, 8), torch.zeros(64, 8))
+    with strict_replication(["ap_af_test"]):
+        with pytest.raises(RuntimeError) as err:
+            _optimizer(gm, fake_mode, mesh_1d)
+    msg = str(err.value)
+    assert "ap_af_test::norule_mut" in msg and "inside auto_functionalized_v2" in msg
+    assert "ap_af_test::norule_pure" in msg
+
+
+def test_strict_replication_ignores_other_namespaces_and_ruled_ops(
+    mesh_1d, monkeypatch
+):
+    gm, fake_mode = _export(NoRule(), torch.randn(64, 8), torch.zeros(64, 8))
+    with strict_replication(["core_ml", "quack"]):
+        _optimizer(gm, fake_mode, mesh_1d)
+    # An op with a registered rule is not a fallback, in a strict namespace or not.
+    gm, fake_mode = _export(OneOp(ROWOP), torch.randn(64, 8), torch.zeros(64, 8))
+    with strict_replication(["ap_af_test"]):
+        _optimizer(gm, fake_mode, mesh_1d)
+    # The environment variable works too.
+    monkeypatch.setenv("AUTOPARALLEL_STRICT_REPLICATION", "ap_af_test")
+    gm, fake_mode = _export(NoRule(), torch.randn(64, 8), torch.zeros(64, 8))
+    with pytest.raises(RuntimeError, match="strict replication"):
+        _optimizer(gm, fake_mode, mesh_1d)

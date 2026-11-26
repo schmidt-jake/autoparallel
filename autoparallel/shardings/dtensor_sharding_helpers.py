@@ -5,6 +5,7 @@
 
 import itertools
 import logging
+import os
 from contextlib import ExitStack, contextmanager
 from typing import Optional
 
@@ -44,6 +45,55 @@ propagator = DTensor._op_dispatcher.sharding_propagator
 
 enable_implicit_replication = False
 _current_stack = None
+
+# Ops that fell back to the all-Replicate strategy (no registered rule, no decomposition),
+# by name, since the last clear_implicit_fallbacks().
+_implicit_fallbacks: list[str] = []
+
+STRICT_REPLICATION_ENV = "AUTOPARALLEL_STRICT_REPLICATION"
+_strict_replication_override: Optional[tuple[str, ...]] = None
+
+
+def _normalize_prefixes(prefixes) -> tuple[str, ...]:
+    out = []
+    for p in prefixes:
+        p = p.strip()
+        if p:
+            out.append(p if p.endswith("::") else p + "::")
+    return tuple(out)
+
+
+def strict_replication_prefixes() -> tuple[str, ...]:
+    """Operator namespaces (``"core_ml::"``) that must not silently fall back to replication.
+
+    Set with :func:`strict_replication` or the ``AUTOPARALLEL_STRICT_REPLICATION`` environment
+    variable (comma-separated namespaces, e.g. ``core_ml,quack``). Empty means off.
+    """
+    if _strict_replication_override is not None:
+        return _strict_replication_override
+    return _normalize_prefixes(os.environ.get(STRICT_REPLICATION_ENV, "").split(","))
+
+
+@contextmanager
+def strict_replication(prefixes):
+    """Make ``ShardingOptimizer`` raise if an op in one of the namespaces gets the implicit
+    all-Replicate strategy, naming each such op and node."""
+    global _strict_replication_override
+    previous = _strict_replication_override
+    _strict_replication_override = _normalize_prefixes(prefixes)
+    try:
+        yield
+    finally:
+        _strict_replication_override = previous
+
+
+def clear_implicit_fallbacks() -> None:
+    _implicit_fallbacks.clear()
+
+
+def implicit_fallbacks() -> list[str]:
+    return list(_implicit_fallbacks)
+
 
 replicate_op_strategy = torch.distributed.tensor._ops.utils.replicate_op_strategy
 
@@ -347,6 +397,7 @@ def get_op_strategy(op: torch._ops.OpOverload, op_schema: OpSchema) -> StrategyT
                 return decomp_result
 
             # Fall back to all-Replicate
+            _implicit_fallbacks.append(op.name())
             # Use the current stack if available
             if _current_stack is not None:
                 _current_stack.enter_context(
