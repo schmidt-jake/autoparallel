@@ -148,13 +148,19 @@ def test_both_backends_find_the_optimum_through_the_optimizer_solve(backend):
 def test_highs_reports_an_infeasible_budget_as_infeasible():
     prob, x, *_ = _placement_problem()
     prob.constraints["memory_budget"].changeRHS(2)
+
+    def no_walk():
+        raise AssertionError(
+            "HiGHS has no point: the violated-constraint walk is skipped"
+        )
+
     optimizer = SimpleNamespace(
         prob=prob,
         solver_time_limit_seconds=60,
         milp_backend="highs",
         solve_report=None,
         _apply_memory_constraint=lambda: None,
-        get_violated_constraints_log=lambda: "",
+        get_violated_constraints_log=no_walk,
     )
     with pytest.raises(RuntimeError, match="could not find a feasible solution"):
         ShardingOptimizer._solve(optimizer)

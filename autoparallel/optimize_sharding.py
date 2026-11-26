@@ -1189,7 +1189,16 @@ class ShardingOptimizer:
             self._select_keys()
             return
         if self.prob.status == pulp.LpStatusInfeasible:
-            logger.warning(self.get_violated_constraints_log())
+            if self.milp_backend == "cbc":
+                logger.warning(self.get_violated_constraints_log())
+            else:
+                # HiGHS proves infeasibility without a point to inspect, and walking every
+                # constraint of a large problem at no point takes minutes and says nothing:
+                # an irreducible infeasible subset (IIS) of the dumped problem is the tool.
+                logger.warning(
+                    "HiGHS proved the sharding problem infeasible; for the conflicting "
+                    "constraints, compute an IIS of the problem (prob.writeMPS)"
+                )
             raise RuntimeError(
                 "The sharding optimizer could not find a feasible solution. "
                 "This typically means the user-specified constraints are "
