@@ -127,9 +127,18 @@ def test_a_binary_within_the_integrality_tolerance_is_selected():
 def test_a_node_without_a_selected_strategy_is_an_error():
     nodes = ["a", "b"]
     optimizer = SimpleNamespace(
-        nodes=nodes,
+        nodes=nodes + ["output"],
+        # Nodes 0 and 1 have choices; the output (2) has no decision variables.
+        decision_vars={(0, 0, 0, 0): None, (1, 0, 0, 0): None},
         selected_keys=[(0, 0, 0, 0)],
         _resolve_decision_var=lambda key: SimpleNamespace(strategy="S"),
     )
-    with pytest.raises(RuntimeError, match="selects no strategy for 1 nodes"):
+    with pytest.raises(
+        RuntimeError, match=r"selects no strategy for 1 nodes, e.g. \['b'\]"
+    ):
         ShardingOptimizer._extract_and_validate_solution(optimizer)
+    optimizer.selected_keys.append((1, 0, 0, 0))
+    assert ShardingOptimizer._extract_and_validate_solution(optimizer) == {
+        "a": "S",
+        "b": "S",
+    }

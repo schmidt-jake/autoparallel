@@ -1256,8 +1256,14 @@ class ShardingOptimizer:
                 )
             seen.add(node_arg)
 
-        # Validate: every node got a strategy (a missed selection would silently drop it)
-        missing = [node for node in self.nodes if node not in selected_by_node]
+        # Validate: every node with a choice got a strategy (a missed selection would
+        # silently drop it); a node without decision variables (the output) has none.
+        choosing = {key[0] for key in self.decision_vars}
+        missing = [
+            self.nodes[i]
+            for i in sorted(choosing)
+            if self.nodes[i] not in selected_by_node
+        ]
         if missing:
             raise RuntimeError(
                 f"the solution selects no strategy for {len(missing)} nodes, e.g. "
