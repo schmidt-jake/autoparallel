@@ -1225,8 +1225,12 @@ class ShardingOptimizer:
 
     def _select_keys(self):
         """The decision variables set to 1, each root with the copies linked to it."""
+        # A binary is selected when its value rounds to 1: CBC returns exact integers,
+        # HiGHS returns them within its integrality tolerance (0.9999999 is a 1).
         self.selected_keys = [
-            key for key, dv in self.decision_vars.items() if dv.var.value() == 1
+            key
+            for key, dv in self.decision_vars.items()
+            if dv.var.value() is not None and dv.var.value() > 0.5
         ]
         for root_key in list(self.selected_keys):
             self.selected_keys.extend(self._root_to_linked.get(root_key, []))
@@ -1251,6 +1255,14 @@ class ShardingOptimizer:
                     f"solutions: {[str(dv.strategy) for dv in selected_by_node[node]]}"
                 )
             seen.add(node_arg)
+
+        # Validate: every node got a strategy (a missed selection would silently drop it)
+        missing = [node for node in self.nodes if node not in selected_by_node]
+        if missing:
+            raise RuntimeError(
+                f"the solution selects no strategy for {len(missing)} nodes, e.g. "
+                f"{[str(n) for n in missing[:5]]}"
+            )
 
         # Validate: all args of a node agree on the same strategy
         for node, dvs in selected_by_node.items():

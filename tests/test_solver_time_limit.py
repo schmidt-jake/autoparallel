@@ -113,3 +113,23 @@ def test_sharding_optimizer_preserves_early_solver_failures(
 
     with pytest.raises(RuntimeError, match=message):
         ShardingOptimizer._solve(optimizer)
+
+
+def test_a_binary_within_the_integrality_tolerance_is_selected():
+    """HiGHS returns a selected binary as 0.9999999 or 1.0000001, not exactly 1."""
+    optimizer = _optimizer(_Problem(pulp.LpStatusOptimal, pulp.LpSolutionOptimal, 1))
+    optimizer.decision_vars[(0, 0, 0, 0)].var.varValue = 0.9999999
+    optimizer.decision_vars[(0, 0, 1, 0)].var.varValue = 1e-7
+    ShardingOptimizer._select_keys(optimizer)
+    assert optimizer.selected_keys == [(0, 0, 0, 0), (1, 0, 0, 0)]
+
+
+def test_a_node_without_a_selected_strategy_is_an_error():
+    nodes = ["a", "b"]
+    optimizer = SimpleNamespace(
+        nodes=nodes,
+        selected_keys=[(0, 0, 0, 0)],
+        _resolve_decision_var=lambda key: SimpleNamespace(strategy="S"),
+    )
+    with pytest.raises(RuntimeError, match="selects no strategy for 1 nodes"):
+        ShardingOptimizer._extract_and_validate_solution(optimizer)
